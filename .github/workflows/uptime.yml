@@ -21,7 +21,12 @@ on:
   schedule:
     - cron: "*/5 * * * *"
     - cron: "0 3 * * 1"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      test_down:
+        description: "Simulate an outage (checks a path that does not exist) to test the alert"
+        type: boolean
+        default: false
 
 permissions:
   contents: write # the weekly heartbeat commit
@@ -32,7 +37,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SITE: https://crm.grupoberseba.com.br
+  # test_down points the checks at a path that answers 404, to exercise the alert end to end.
+  SITE: ${{ inputs.test_down && 'https://crm.grupoberseba.com.br/__uptime-test-down__' || 'https://crm.grupoberseba.com.br' }}
   HOST: crm.grupoberseba.com.br
   ALERT_LABEL: fora-do-ar
   ASSIGNEES: matheusmmjs
@@ -91,7 +97,7 @@ jobs:
           fi
 
   weekly:
-    if: github.event.schedule == '0 3 * * 1' || github.event_name == 'workflow_dispatch'
+    if: github.event.schedule == '0 3 * * 1' || (github.event_name == 'workflow_dispatch' && !inputs.test_down)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
