@@ -1,0 +1,119 @@
+name: uptime
+
+# Berseba's external uptime monitor for the CRM (crm.grupoberseba.com.br).
+# It runs on GitHub, outside the VPS: a monitor on the same box dies with it.
+#
+# Every 5 minutes: /api/v1/health must answer 200 with status "healthy",
+# "/" must answer 200 and "/app" 307 (the CRM's own deploy check). A check
+# only counts as DOWN after 3 failed attempts 30 s apart, so a single slow
+# answer or an update restart does not page anyone.
+#   - down and no open alert  -> open an issue assigned to the partners
+#     (GitHub notifies by e-mail and by the GitHub mobile app)
+#   - up and an open alert    -> comment how long it was down and close it
+# GitHub delays scheduled runs by 5-15 min under load; detection takes up to
+# ~20 min in the worst case.
+#
+# Mondays 03:00 UTC: TLS certificate expiry check (alert under 14 days) and a
+# heartbeat commit — GitHub disables scheduled workflows of a repository with
+# no activity for 60 days, and this repository is otherwise never touched.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+    - cron: "0 3 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # the weekly heartbeat commit
+  issues: write # open/close the alert issue
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+env:
+  SITE: https://crm.grupoberseba.com.br
+  HOST: crm.grupoberseba.com.br
+  ALERT_LABEL: fora-do-ar
+  ASSIGNEES: matheusmmjs
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Check the CRM
+        id: check
+        run: |
+          set -u
+          probe() {
+            local h root app status
+            h=$(curl -s -m 20 -o /tmp/health.json -w '%{http_code}' "$SITE/api/v1/health" || echo 000)
+            status=$(python3 -c 'import json;print(json.load(open("/tmp/health.json"))["data"]["status"])' 2>/dev/null || echo "?")
+            root=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$SITE/" || echo 000)
+            app=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$SITE/app" || echo 000)
+            DETAIL="health=$h ($status) /=$root /app=$app"
+            [ "$h" = 200 ] && [ "$status" = healthy ] && [ "$root" = 200 ] && [ "$app" = 307 ]
+          }
+          ok=no
+          for attempt in 1 2 3; do
+            if probe; then ok=yes; break; fi
+            echo "attempt $attempt failed: $DETAIL"
+            [ "$attempt" -lt 3 ] && sleep 30
+          done
+          echo "result: ok=$ok · $DETAIL"
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+          echo "detail=$DETAIL" >> "$GITHUB_OUTPUT"
+
+      - name: Open or close the alert
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OK: ${{ steps.check.outputs.ok }}
+          DETAIL: ${{ steps.check.outputs.detail }}
+        run: |
+          set -euo pipefail
+          open=$(gh issue list -R "$GITHUB_REPOSITORY" --label "$ALERT_LABEL" --state open --json number,createdAt --jq '.[0] // empty')
+          now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          if [ "$OK" = no ] && [ -z "$open" ]; then
+            gh issue create -R "$GITHUB_REPOSITORY" --label "$ALERT_LABEL" --assignee "$ASSIGNEES" \
+              --title "🔴 CRM fora do ar ($HOST)" \
+              --body "O monitor não conseguiu acessar o CRM em 3 tentativas (30 s entre elas).
+
+          - Quando: $now (UTC; Brasília = UTC−3)
+          - O que respondeu: \`$DETAIL\`
+
+          O que olhar primeiro: o painel da Hostinger (o servidor pode ter desligado, como em 17/10 e 23/10) e a página de status da Hostinger. Este alerta fecha sozinho quando o CRM voltar."
+          elif [ "$OK" = yes ] && [ -n "$open" ]; then
+            n=$(echo "$open" | python3 -c 'import json,sys;print(json.load(sys.stdin)["number"])')
+            since=$(echo "$open" | python3 -c 'import json,sys;print(json.load(sys.stdin)["createdAt"])')
+            mins=$(python3 -c "import datetime as d;a=d.datetime.fromisoformat('$since'.replace('Z','+00:00'));print(int((d.datetime.now(d.timezone.utc)-a).total_seconds()//60))")
+            gh issue close "$n" -R "$GITHUB_REPOSITORY" --comment "✅ O CRM voltou ($now UTC). Ficou fora por cerca de $mins minutos (contando desde o alerta)."
+          fi
+          [ "$OK" = yes ] || exit 1
+
+  weekly:
+    if: github.event.schedule == '0 3 * * 1' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: TLS certificate expiry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          end=$(echo | openssl s_client -servername "$HOST" -connect "$HOST:443" 2>/dev/null | openssl x509 -noout -enddate | cut -d= -f2)
+          days=$(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
+          echo "certificate ends $end ($days days)"
+          if [ "$days" -lt 14 ]; then
+            gh issue create -R "$GITHUB_REPOSITORY" --label "$ALERT_LABEL" --assignee "$ASSIGNEES" \
+              --title "⚠️ Certificado do CRM vence em $days dias" \
+              --body "O certificado HTTPS de $HOST vence em $end. Ele devia renovar sozinho (Caddy); se este aviso apareceu, a renovação automática está falhando."
+          fi
+      - name: Heartbeat (keeps the schedule alive)
+        run: |
+          date -u +%Y-%m-%dT%H:%M:%SZ > heartbeat.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add heartbeat.txt
+          git commit -qm "heartbeat" && git push -q
